@@ -1,0 +1,57 @@
+# .NET
+bin/
+obj/
+*.dll
+*.exe
+*.pdb
+*.user
+*.suo
+*.cache
+*.log
+
+# VS
+.vs/
+*.vsix
+*.userosscache
+*.sln.docstates
+
+# Build results
+[Dd]ebug/
+[Rr]elease/
+x64/
+x86/
+[Aa][Rr][Mm]/
+[Aa][Rr][Ss]/
+bld/
+[Bb]in/
+[Oo]bj/
+
+# NuGet
+*.nupkg
+.nuget/
+packages/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+Thumbs.db
+.DS_Store
+
+# Logs
+*.log
+
+# Frontend build output
+dist/
+
+# Dependencies
+node_modules/
+
+# Uploads
+Uploads/
+
+# Data Protection Keys
+DataProtectionKeys/

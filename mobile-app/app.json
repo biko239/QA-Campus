@@ -1,0 +1,18 @@
+{
+  "expo": {
+    "name": "University Portal",
+    "slug": "fyp-mobile-app",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "userInterfaceStyle": "light",
+    "assetBundlePatterns": ["**/*"],
+    "ios": {
+      "supportsTablet": true
+    },
+    "android": {
+      "adaptiveIcon": {
+        "backgroundColor": "#142744"
+      }
+    }
+  }
+}
