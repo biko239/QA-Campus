@@ -15,7 +15,7 @@ QA Campus is an ASP.NET Core, React, and Expo project for university document up
 ## Run From Visual Studio
 
 1. Open `Fyp.sln`.
-2. Select the `QA Campus` launch profile.
+2. Select the `QACampus` launch profile.
 3. Press the green Start button.
 
 Visual Studio will build the React client, start the ASP.NET Core backend, and open the app at `http://localhost:5110`.
