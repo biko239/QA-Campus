@@ -16,4 +16,10 @@
     <PackageReference Include="Pomelo.EntityFrameworkCore.MySql" Version="8.0.0" />
     <PackageReference Include="UglyToad.PdfPig" Version="1.7.0-custom-5" />
   </ItemGroup>
+  <Target Name="BuildReactClient" BeforeTargets="Build" Condition="Exists('$(MSBuildProjectDirectory)\client-web\package.json')">
+    <Message Importance="high" Text="Restoring React client dependencies..." Condition="!Exists('$(MSBuildProjectDirectory)\client-web\node_modules')" />
+    <Exec WorkingDirectory="$(MSBuildProjectDirectory)\client-web" Command="npm ci" Condition="!Exists('$(MSBuildProjectDirectory)\client-web\node_modules')" />
+    <Message Importance="high" Text="Building React client for ASP.NET Core..." />
+    <Exec WorkingDirectory="$(MSBuildProjectDirectory)\client-web" Command="npm run build" />
+  </Target>
 </Project>
