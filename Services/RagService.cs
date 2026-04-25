@@ -40,7 +40,7 @@ namespace Fyp.Services
             _ml = ml;
             _qdrant = qdrant;
             _http = httpClientFactory.CreateClient();
-            _http.Timeout = TimeSpan.FromSeconds(8);
+            _http.Timeout = TimeSpan.FromSeconds(45);
             _logger = logger;
         }
 
@@ -108,32 +108,6 @@ namespace Fyp.Services
             _db.Questions.Add(question);
             await _db.SaveChangesAsync();
 
-            var documents = await GetReadyPublicDocumentsAsync();
-            var explicitDocumentMatches = FindExplicitDocumentMatches(documents, questionText);
-            var recentDocument = await GetRecentDocumentContextAsync(userId, question.Id, documents);
-            var targetDocument = explicitDocumentMatches.Count == 1 ? explicitDocumentMatches[0] : recentDocument;
-            var calendarIntent = LooksLikeCalendarQuestion(questionText);
-            var creditRegistrationIntent = LooksLikeCreditRegistrationQuestion(questionText);
-
-            if (targetDocument != null && IsCalendarDocument(targetDocument) && !calendarIntent)
-                targetDocument = null;
-
-            if (creditRegistrationIntent)
-                targetDocument = FindBestAcademicRulesDocument(documents, questionText) ?? targetDocument;
-
-            if (targetDocument == null && calendarIntent && !creditRegistrationIntent)
-            {
-                var calendarDocuments = documents.Where(IsCalendarDocument).ToList();
-                if (calendarDocuments.Count == 1)
-                    targetDocument = calendarDocuments[0];
-            }
-            else if (explicitDocumentMatches.Count == 0 && calendarIntent && !creditRegistrationIntent)
-            {
-                var calendarDocuments = documents.Where(IsCalendarDocument).ToList();
-                if (calendarDocuments.Count == 1)
-                    targetDocument = calendarDocuments[0];
-            }
-
             if (IsSmallTalk(questionText))
             {
                 var smallTalkAnswer = BuildSmallTalkAnswer(questionText);
@@ -165,6 +139,36 @@ namespace Fyp.Services
 
                 await _db.SaveChangesAsync();
                 return (transformedAnswer, previousTurn.Citations);
+            }
+
+            var useGenericPipeline = !bool.TryParse(_cfg["Rag:UseGenericPipeline"], out var configuredGenericPipeline) || configuredGenericPipeline;
+            if (useGenericPipeline)
+                return await AskWithGenericPipelineAsync(question, questionText);
+
+            var documents = await GetReadyPublicDocumentsAsync();
+            var explicitDocumentMatches = FindExplicitDocumentMatches(documents, questionText);
+            var recentDocument = await GetRecentDocumentContextAsync(userId, question.Id, documents);
+            var targetDocument = explicitDocumentMatches.Count == 1 ? explicitDocumentMatches[0] : recentDocument;
+            var calendarIntent = LooksLikeCalendarQuestion(questionText);
+            var creditRegistrationIntent = LooksLikeCreditRegistrationQuestion(questionText);
+
+            if (targetDocument != null && IsCalendarDocument(targetDocument) && !calendarIntent)
+                targetDocument = null;
+
+            if (creditRegistrationIntent)
+                targetDocument = FindBestAcademicRulesDocument(documents, questionText) ?? targetDocument;
+
+            if (targetDocument == null && calendarIntent && !creditRegistrationIntent)
+            {
+                var calendarDocuments = documents.Where(IsCalendarDocument).ToList();
+                if (calendarDocuments.Count == 1)
+                    targetDocument = calendarDocuments[0];
+            }
+            else if (explicitDocumentMatches.Count == 0 && calendarIntent && !creditRegistrationIntent)
+            {
+                var calendarDocuments = documents.Where(IsCalendarDocument).ToList();
+                if (calendarDocuments.Count == 1)
+                    targetDocument = calendarDocuments[0];
             }
 
             var topicClarification = TryBuildTopicClarification(questionText, documents, explicitDocumentMatches, targetDocument);
@@ -390,6 +394,731 @@ namespace Fyp.Services
                 _logger.LogWarning(ex, "AI rerank failed. Falling back to keyword database search.");
                 return new List<(DocumentChunk chunk, float score)>();
             }
+        }
+
+        private async Task<(Answer answer, List<(DocumentChunk chunk, float score)> citations)> AskWithGenericPipelineAsync(Question question, string questionText)
+        {
+            var documents = await GetReadyPublicDocumentsAsync();
+            if (documents.Count == 0)
+            {
+                var emptyAnswer = await SaveAnswerAsync(question.Id, "I do not have any ready uploaded documents to answer from yet.", 0.1f);
+                return (emptyAnswer, new List<(DocumentChunk chunk, float score)>());
+            }
+
+            var explicitDocumentMatches = FindStrictDocumentReferences(documents, questionText);
+            if (explicitDocumentMatches.Count > 1)
+            {
+                var answerText = BuildDocumentDisambiguationAnswer(explicitDocumentMatches);
+                var clarificationAnswer = await SaveAnswerAsync(question.Id, answerText, 0.6f);
+                return (clarificationAnswer, new List<(DocumentChunk chunk, float score)>());
+            }
+
+            var targetDocument = explicitDocumentMatches.Count == 1
+                ? explicitDocumentMatches[0]
+                : await TryGetReferencedPreviousDocumentAsync(question.UserId, question.Id, documents, questionText);
+
+            var configuredTopK = int.TryParse(_cfg["Rag:TopK"], out var parsedTopK) ? parsedTopK : 6;
+            var topK = Math.Clamp(configuredTopK, 4, 10);
+            var citations = await RetrieveGenericCitationsAsync(questionText, topK, targetDocument?.Id);
+
+            var finalAnswer = HumanizeAnswerText(await GenerateGenericAnswerAsync(questionText, citations));
+            var confidence = citations.Count > 0 ? citations[0].score : 0.1f;
+            var answer = await SaveAnswerAsync(question.Id, finalAnswer, confidence);
+
+            foreach (var citation in citations)
+            {
+                _db.ChunkUsages.Add(new ChunkUsage
+                {
+                    AnswerId = answer.Id,
+                    ChunkId = citation.chunk.Id,
+                    Score = citation.score
+                });
+            }
+
+            await _db.SaveChangesAsync();
+
+            return (answer, citations);
+        }
+
+        private async Task<Document?> TryGetReferencedPreviousDocumentAsync(int userId, int currentQuestionId, List<Document> documents, string questionText)
+        {
+            if (!RefersToPreviousDocument(questionText))
+                return null;
+
+            return await GetRecentDocumentContextAsync(userId, currentQuestionId, documents);
+        }
+
+        private static bool RefersToPreviousDocument(string questionText)
+        {
+            var normalized = NormalizeForMatch(questionText);
+            return QuestionContainsAny(normalized, "this document", "that document", "this pdf", "that pdf", "it", "there", "same document");
+        }
+
+        private async Task<List<(DocumentChunk chunk, float score)>> RetrieveGenericCitationsAsync(string questionText, int topK, int? targetDocumentId)
+        {
+            var candidatePoolSize = Math.Max(topK * 10, 60);
+
+            var allCandidates = await _db.DocumentChunks
+                .Include(c => c.Document)
+                .Where(c =>
+                    c.Document != null &&
+                    c.Document.IsPublic &&
+                    c.Document.Status == "READY" &&
+                    (!targetDocumentId.HasValue || c.DocumentId == targetDocumentId.Value))
+                .ToListAsync();
+
+            if (allCandidates.Count == 0)
+                return new List<(DocumentChunk chunk, float score)>();
+
+            var vectorCandidates = await TryVectorSearchAsync(questionText, candidatePoolSize, targetDocumentId);
+            var terms = BuildGenericRetrievalTerms(questionText);
+            var preferEvidenceRanking = IsAmountOrLimitQuestion(questionText);
+
+            var lexicalCandidates = allCandidates
+                .Select(chunk => (chunk, score: ScoreChunkGeneric(chunk, terms, questionText)))
+                .Where(item => item.score > 0)
+                .OrderByDescending(item => item.score)
+                .ThenBy(item => item.chunk.ChunkIndex)
+                .Take(candidatePoolSize)
+                .ToList();
+
+            var merged = ApplyGenericDocumentFit(questionText, MergeGenericCandidates(vectorCandidates, lexicalCandidates, candidatePoolSize));
+            if (merged.Count == 0 && targetDocumentId.HasValue)
+            {
+                merged = allCandidates
+                    .OrderBy(chunk => chunk.ChunkIndex)
+                    .Take(topK)
+                    .Select(chunk => (chunk, score: 0.35f))
+                    .ToList();
+            }
+
+            if (preferEvidenceRanking)
+                return await AddAdjacentContextCitationsAsync(merged.Take(1).ToList(), Math.Min(topK, 3));
+
+            var rerankCandidates = merged
+                .Select(item => item.chunk)
+                .DistinctBy(chunk => chunk.Id)
+                .Take(Math.Max(topK * 8, 48))
+                .ToList();
+
+            var rerankTake = Math.Min(rerankCandidates.Count, Math.Max(topK * 4, 24));
+            var aiRanked = await TryAiRerankChunksAsync(questionText, rerankCandidates, rerankTake);
+            List<(DocumentChunk chunk, float score)> ranked;
+            if (aiRanked.Count > 0)
+                ranked = BlendGenericRerankScores(questionText, aiRanked, merged, topK);
+            else
+                ranked = merged.Take(topK).ToList();
+
+            if (LooksLikeCalendarQuestion(questionText))
+            {
+                var calendarRanked = ranked
+                    .Where(item => item.chunk.Document != null && IsCalendarDocument(item.chunk.Document))
+                    .ToList();
+
+                if (calendarRanked.Count > 0)
+                    return await AddAdjacentContextCitationsAsync(calendarRanked.Take(Math.Min(topK, 3)).ToList(), Math.Min(topK, 3));
+            }
+
+            return await AddAdjacentContextCitationsAsync(ranked, topK);
+        }
+
+        private async Task<List<(DocumentChunk chunk, float score)>> AddAdjacentContextCitationsAsync(
+            List<(DocumentChunk chunk, float score)> ranked,
+            int baseLimit)
+        {
+            var selected = ranked.Take(baseLimit).ToList();
+            var anchors = selected
+                .Where(item => item.chunk.DocumentId > 0)
+                .Take(3)
+                .ToList();
+
+            if (anchors.Count == 0)
+                return selected;
+
+            var documentIds = anchors.Select(item => item.chunk.DocumentId).Distinct().ToList();
+            var chunkIndexes = anchors
+                .SelectMany(item => new[] { item.chunk.ChunkIndex - 1, item.chunk.ChunkIndex + 1 })
+                .Where(index => index >= 0)
+                .Distinct()
+                .ToList();
+
+            var neighbors = await _db.DocumentChunks
+                .Include(c => c.Document)
+                .Where(c =>
+                    c.Document != null &&
+                    c.Document.IsPublic &&
+                    c.Document.Status == "READY" &&
+                    documentIds.Contains(c.DocumentId) &&
+                    chunkIndexes.Contains(c.ChunkIndex))
+                .ToListAsync();
+
+            var output = new List<(DocumentChunk chunk, float score)>();
+            var seen = new HashSet<int>();
+
+            foreach (var item in selected)
+            {
+                if (seen.Add(item.chunk.Id))
+                    output.Add(item);
+
+                foreach (var neighbor in neighbors
+                    .Where(n => n.DocumentId == item.chunk.DocumentId && Math.Abs(n.ChunkIndex - item.chunk.ChunkIndex) == 1)
+                    .OrderBy(n => n.ChunkIndex))
+                {
+                    if (seen.Add(neighbor.Id))
+                        output.Add((neighbor, Math.Max(item.score - 0.25f, 0.1f)));
+                }
+            }
+
+            return output.Take(Math.Max(baseLimit + 4, baseLimit)).ToList();
+        }
+
+        private static List<(DocumentChunk chunk, float score)> BlendGenericRerankScores(
+            string questionText,
+            List<(DocumentChunk chunk, float score)> aiRanked,
+            List<(DocumentChunk chunk, float score)> retrievalRanked,
+            int topK)
+        {
+            var retrievalScores = retrievalRanked
+                .GroupBy(item => item.chunk.Id)
+                .ToDictionary(group => group.Key, group => group.Max(item => item.score));
+
+            var blended = aiRanked
+                .Select(item =>
+                {
+                    retrievalScores.TryGetValue(item.chunk.Id, out var retrievalScore);
+                    var score = (item.score * 8f) + retrievalScore + GetGenericDocumentFitScore(item.chunk, questionText);
+                    return (item.chunk, score);
+                })
+                .Where(item => item.score > 0)
+                .OrderByDescending(item => item.score)
+                .ThenBy(item => item.chunk.ChunkIndex)
+                .Take(topK)
+                .ToList();
+
+            return blended.Count > 0
+                ? blended
+                : retrievalRanked.Take(topK).ToList();
+        }
+
+        private static List<(DocumentChunk chunk, float score)> ApplyGenericDocumentFit(
+            string questionText,
+            List<(DocumentChunk chunk, float score)> candidates)
+        {
+            return candidates
+                .Select(item => (item.chunk, score: item.score + GetGenericDocumentFitScore(item.chunk, questionText)))
+                .Where(item => item.score > 0)
+                .OrderByDescending(item => item.score)
+                .ThenBy(item => item.chunk.Document?.Title)
+                .ThenBy(item => item.chunk.ChunkIndex)
+                .ToList();
+        }
+
+        private static float GetGenericDocumentFitScore(DocumentChunk chunk, string questionText)
+        {
+            if (chunk.Document == null)
+                return 0;
+
+            var score = 0f;
+            var isCalendarDocument = IsCalendarDocument(chunk.Document);
+            var asksForSchedule = LooksLikeCalendarQuestion(questionText);
+            var normalizedQuestion = NormalizeForMatch(questionText);
+            var metadata = NormalizeForMatch($"{chunk.Document.Title} {chunk.Document.OriginalFileName} {chunk.Document.Category} {chunk.Document.Tags}");
+
+            if (isCalendarDocument && asksForSchedule)
+                score += 5;
+            else if (isCalendarDocument)
+                score -= 10;
+
+            if (!asksForSchedule && QuestionContainsAny(normalizedQuestion, "rule", "rules", "policy", "procedure", "regulation", "regulations", "allowed", "limit", "maximum", "minimum", "how much", "how many"))
+            {
+                if (QuestionContainsAny(metadata, "regulation", "regulations", "reglement", "policy", "policies", "procedure", "procedures"))
+                    score += 3;
+            }
+
+            return score;
+        }
+
+        private static List<(DocumentChunk chunk, float score)> MergeGenericCandidates(
+            List<(DocumentChunk chunk, float score)> vectorCandidates,
+            List<(DocumentChunk chunk, float score)> lexicalCandidates,
+            int take)
+        {
+            var merged = new Dictionary<int, (DocumentChunk chunk, float score)>();
+
+            foreach (var (chunk, score) in vectorCandidates)
+            {
+                var normalizedScore = 2.5f + Math.Max(score, 0);
+                merged[chunk.Id] = (chunk, normalizedScore);
+            }
+
+            foreach (var (chunk, score) in lexicalCandidates)
+            {
+                var normalizedScore = Math.Min(score, 30f) / 3f;
+                if (merged.TryGetValue(chunk.Id, out var existing))
+                    merged[chunk.Id] = (chunk, existing.score + normalizedScore);
+                else
+                    merged[chunk.Id] = (chunk, normalizedScore);
+            }
+
+            return merged.Values
+                .OrderByDescending(item => item.score)
+                .ThenBy(item => item.chunk.Document?.Title)
+                .ThenBy(item => item.chunk.ChunkIndex)
+                .Take(take)
+                .ToList();
+        }
+
+        private async Task<string> GenerateGenericAnswerAsync(string questionText, List<(DocumentChunk chunk, float score)> citations)
+        {
+            if (citations.Count == 0)
+                return "I could not find enough reliable information in the uploaded documents to answer that.";
+
+            var groundedAnswer = BuildGroundedGenericAnswer(questionText, citations);
+            var useGenerator = bool.TryParse(_cfg["Rag:UseGenerator"], out var configuredUseGenerator) && configuredUseGenerator;
+            if (!useGenerator)
+                return groundedAnswer;
+
+            var aiBaseUrl = (_cfg["AiService:BaseUrl"] ?? _cfg["MlService:BaseUrl"] ?? "http://127.0.0.1:8000").TrimEnd('/');
+            var request = new GenerateRequest
+            {
+                Question = questionText,
+                Chunks = citations
+                    .Take(6)
+                    .Select(c => new GenerateChunkItem
+                    {
+                        ChunkId = c.chunk.Id,
+                        DocumentTitle = c.chunk.Document?.Title ?? "Unknown Document",
+                        Text = Preview(c.chunk.Text, 1600),
+                        Score = c.score
+                    })
+                    .ToList()
+            };
+
+            try
+            {
+                var response = await _http.PostAsJsonAsync($"{aiBaseUrl}/generate", request);
+                if (!response.IsSuccessStatusCode)
+                {
+                    var raw = await response.Content.ReadAsStringAsync();
+                    _logger.LogWarning("AI generate service returned {StatusCode}: {Body}", response.StatusCode, raw);
+                    return groundedAnswer;
+                }
+
+                var result = await response.Content.ReadFromJsonAsync<GenerateResponse>();
+                if (result == null || string.IsNullOrWhiteSpace(result.Answer) || !result.Supported)
+                    return groundedAnswer;
+
+                return result.Answer.Trim();
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "AI generate service failed. Returning grounded extractive answer.");
+                return groundedAnswer;
+            }
+        }
+
+        private static string BuildGroundedGenericAnswer(string questionText, List<(DocumentChunk chunk, float score)> citations)
+        {
+            if (LooksLikeCalendarQuestion(questionText))
+            {
+                var calendarCitations = citations
+                    .Where(citation => citation.chunk.Document != null && IsCalendarDocument(citation.chunk.Document))
+                    .ToList();
+
+                if (calendarCitations.Count > 0)
+                    return BuildCalendarExtractiveAnswer(calendarCitations, questionText);
+            }
+
+            var terms = BuildGenericRetrievalTerms(questionText);
+            var groups = citations
+                .Where(citation => citation.chunk.Document != null)
+                .GroupBy(citation => citation.chunk.Document!.Id)
+                .Take(3)
+                .ToList();
+
+            if (groups.Count == 0)
+                return "I found relevant text, but I could not connect it to a reliable uploaded document.";
+
+            var parts = new List<string>();
+            foreach (var group in groups)
+            {
+                var document = group.First().chunk.Document!;
+                var snippets = ExtractGenericEvidenceSentences(group, terms, questionText, groups.Count == 1 ? 4 : 2);
+
+                if (snippets.Count == 0)
+                {
+                    snippets = group
+                        .OrderByDescending(citation => ScoreAnswerSnippet(citation.chunk.Text, terms, questionText))
+                        .ThenByDescending(citation => citation.score)
+                        .ThenBy(citation => citation.chunk.ChunkIndex)
+                        .Select(citation => ExtractBestSnippet(citation.chunk.Text, terms, 560))
+                        .Where(snippet => !string.IsNullOrWhiteSpace(snippet))
+                        .Select(PolishSnippet)
+                        .GroupBy(snippet => NormalizeForMatch(Preview(snippet, 180)))
+                        .Select(grouping => grouping.First())
+                        .Take(groups.Count == 1 ? 3 : 2)
+                        .ToList();
+                }
+
+                if (snippets.Count == 0)
+                    snippets.Add(FormatSourcePreview(group.First().chunk.Text, 560));
+
+                if (groups.Count == 1)
+                {
+                    var directAnswer = TryBuildDirectGenericAnswer(questionText, document.Title, snippets);
+                    if (!string.IsNullOrWhiteSpace(directAnswer))
+                        return directAnswer;
+
+                    return $"Based on \"{document.Title}\":\n\n- {string.Join("\n- ", snippets)}\n\nOpen the proof to see the exact PDF evidence.";
+                }
+
+                parts.Add($"From \"{document.Title}\":\n- {string.Join("\n- ", snippets)}");
+            }
+
+            return "I found relevant information in these uploaded documents:\n\n" + string.Join("\n\n", parts) + "\n\nOpen the proof to see the exact PDF evidence.";
+        }
+
+        private static List<string> ExtractGenericEvidenceSentences(
+            IEnumerable<(DocumentChunk chunk, float score)> citations,
+            List<string> terms,
+            string questionText,
+            int take)
+        {
+            var ordered = citations
+                .OrderBy(citation => citation.chunk.ChunkIndex)
+                .ToList();
+
+            var combined = CleanTextForAnswer(string.Join(" ", ordered.Select(citation => citation.chunk.Text ?? "")));
+            var sentences = SplitEvidenceSentences(combined)
+                .Select((sentence, index) => new
+                {
+                    Index = index,
+                    Text = PolishSnippet(sentence),
+                    Score = ScoreAnswerSnippet(sentence, terms, questionText)
+                })
+                .Where(item => item.Score > 0 && item.Text.Length >= 35)
+                .Where(item => !NormalizeForMatch(item.Text).Contains("table des matieres"))
+                .GroupBy(item => NormalizeForMatch(Preview(item.Text, 180)))
+                .Select(group => group.OrderByDescending(item => item.Score).First())
+                .OrderByDescending(item => item.Score)
+                .ThenBy(item => item.Index)
+                .Take(take)
+                .OrderBy(item => item.Index)
+                .Select(item => item.Text)
+                .ToList();
+
+            return sentences;
+        }
+
+        private static List<string> SplitEvidenceSentences(string text)
+        {
+            var cleaned = CleanTextForAnswer(text);
+            if (string.IsNullOrWhiteSpace(cleaned))
+                return new List<string>();
+
+            return Regex
+                .Split(cleaned, @"(?<=[.!?])\s+(?=[A-Z0-9À-ÖØ-Þ])", RegexOptions.CultureInvariant)
+                .Select(sentence => sentence.Trim())
+                .Where(sentence => sentence.Length > 0)
+                .ToList();
+        }
+
+        private static string? TryBuildDirectGenericAnswer(string questionText, string documentTitle, List<string> evidenceSentences)
+        {
+            var asksForAmount = IsAmountOrLimitQuestion(questionText);
+            if (!asksForAmount)
+                return null;
+
+            foreach (var sentence in evidenceSentences)
+            {
+                var amount = TryExtractAmountLimit(sentence);
+                if (amount == null)
+                    continue;
+
+                var relatedEvidence = evidenceSentences
+                    .Where(item => !string.Equals(item, sentence, StringComparison.Ordinal))
+                    .Where(item => QuestionContainsAny(NormalizeForMatch(item), "exception", "exceptionnellement", "derogation", "demande", "request", "approval", "recteur", "rector"))
+                    .Take(1)
+                    .ToList();
+
+                var evidence = new List<string> { sentence };
+                evidence.AddRange(relatedEvidence);
+
+                return $"Based on \"{documentTitle}\", {amount}\n\nEvidence:\n- {string.Join("\n- ", evidence)}";
+            }
+
+            return null;
+        }
+
+        private static string? TryExtractAmountLimit(string sentence)
+        {
+            var normalized = NormalizeForMatch(sentence);
+            var maximumMatch = Regex.Match(
+                sentence,
+                @"maximum\s+de\s+(?<value>\d+(?:[.,]\d+)?)\s+(?<unit>[\p{L}]+)",
+                RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+
+            if (maximumMatch.Success)
+            {
+                var value = maximumMatch.Groups["value"].Value;
+                var unit = NormalizeAnswerUnit(maximumMatch.Groups["unit"].Value);
+                var period = QuestionContainsAny(normalized, "semestre", "semester") ? " per semester" : "";
+                return $"the maximum is {value} {unit}{period}.";
+            }
+
+            var minimumMatch = Regex.Match(
+                sentence,
+                @"(?:minimum\s+de|au\s+moins)\s+(?<value>\d+(?:[.,]\d+)?)\s+(?<unit>[\p{L}]+)",
+                RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+
+            if (minimumMatch.Success)
+            {
+                var value = minimumMatch.Groups["value"].Value;
+                var unit = NormalizeAnswerUnit(minimumMatch.Groups["unit"].Value);
+                var period = QuestionContainsAny(normalized, "semestre", "semester") ? " per semester" : "";
+                return $"the minimum mentioned is {value} {unit}{period}.";
+            }
+
+            return null;
+        }
+
+        private static string NormalizeAnswerUnit(string unit)
+        {
+            var normalized = NormalizeForMatch(unit);
+            if (normalized.StartsWith("credit", StringComparison.OrdinalIgnoreCase))
+                return "ECTS credits";
+
+            return unit;
+        }
+
+        private static bool IsAmountOrLimitQuestion(string questionText)
+        {
+            var normalized = NormalizeForMatch(questionText);
+            return QuestionContainsAny(normalized, "how much", "how many", "amount", "number", "maximum", "minimum", "limit", "limits", "allowed", "can register", "can take");
+        }
+
+        private static float ScoreAnswerSnippet(string text, List<string> terms, string questionText)
+        {
+            var normalized = NormalizeForMatch(text);
+            var normalizedQuestion = NormalizeForMatch(questionText);
+            var asksForAmount = IsAmountOrLimitQuestion(questionText);
+            var score = 0f;
+
+            foreach (var term in terms.Select(NormalizeForMatch).Where(term => term.Length > 2))
+            {
+                if (normalized.Contains(term))
+                    score += 1.5f;
+            }
+
+            if (asksForAmount && Regex.IsMatch(normalized, @"\b\d+(?:[.,]\d+)?\b", RegexOptions.CultureInvariant))
+                score += 5;
+
+            if (asksForAmount && QuestionContainsAny(normalized, "minimum", "maximum", "au moins", "ne peut", "superieur", "exceder", "depasse", "limite"))
+                score += 4;
+
+            if (asksForAmount && QuestionContainsAny(normalized, "exception", "exceptionnellement", "derogation", "demande", "request", "approval", "recteur", "rector"))
+                score += 3;
+
+            if (QuestionContainsAny(normalizedQuestion, "objective", "purpose", "aim", "objet") &&
+                QuestionContainsAny(normalized, "objective", "purpose", "aim", "objet"))
+            {
+                score += 6;
+            }
+
+            if (normalized.Contains("table des matieres") || normalized.Contains("table of contents"))
+                score -= 8;
+
+            return score;
+        }
+
+        private static List<string> BuildGenericRetrievalTerms(string questionText)
+        {
+            var terms = ExpandQueryTerms(Tokenize(questionText))
+                .Select(NormalizeForMatch)
+                .Where(term => term.Length > 2)
+                .ToHashSet(StringComparer.OrdinalIgnoreCase);
+
+            var normalizedQuestion = NormalizeForMatch(questionText);
+
+            if (QuestionContainsAny(normalizedQuestion, "how much", "how many", "amount", "number", "maximum", "minimum", "limit", "limits"))
+                AddTerms(terms, "amount", "number", "maximum", "minimum", "limit", "limits", "nombre", "limite", "exceder", "excede", "depasse", "superieur", "inferieur");
+
+            if (terms.Overlaps(new[] { "credit", "credits", "ects", "credit ects" }))
+                AddTerms(terms, "credit", "credits", "ects", "credit ects", "credits ects");
+
+            if (terms.Overlaps(new[] { "semester", "semesters", "semestre", "semestres", "sem" }))
+                AddTerms(terms, "semester", "semesters", "semestre", "semestres", "sem");
+
+            if (terms.Overlaps(new[] { "register", "registered", "registration", "registrations", "inscription", "inscrire", "inscrit", "inscrite" }))
+                AddTerms(terms, "register", "registered", "registration", "registrations", "inscription", "inscriptions", "inscrire", "inscrit", "inscrite");
+
+            if (terms.Overlaps(new[] { "student", "students", "etudiant", "etudiants" }))
+                AddTerms(terms, "student", "students", "etudiant", "etudiants", "eleve", "eleves");
+
+            if (terms.Overlaps(new[] { "date", "dates", "deadline", "deadlines", "delai", "echeance" }))
+                AddTerms(terms, "date", "dates", "deadline", "deadlines", "delai", "delais", "echeance", "echeances");
+
+            if (terms.Overlaps(new[] { "rule", "rules", "regulation", "regulations", "policy", "procedure" }))
+                AddTerms(terms, "rule", "rules", "regulation", "regulations", "reglement", "reglements", "policy", "policies", "politique", "procedure", "procedures");
+
+            if (terms.Overlaps(new[] { "password", "access", "login", "account" }))
+                AddTerms(terms, "password", "mot de passe", "access", "acces", "login", "account", "compte");
+
+            return terms
+                .Where(term => !GenericAnswerTerms.Contains(term))
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .ToList();
+        }
+
+        private static float ScoreChunkGeneric(DocumentChunk chunk, List<string> terms, string questionText)
+        {
+            var cleaned = CleanTextForAnswer(chunk.Text);
+            var text = NormalizeForMatch(cleaned);
+            var title = NormalizeForMatch(chunk.Document?.Title);
+            var metadata = NormalizeForMatch($"{chunk.Document?.Department} {chunk.Document?.Course} {chunk.Document?.Category} {chunk.Document?.Tags}");
+            var question = NormalizeForMatch(questionText);
+
+            float score = 0;
+
+            if (question.Length > 8 && text.Contains(question))
+                score += 18;
+
+            foreach (var term in terms)
+            {
+                var normalizedTerm = NormalizeForMatch(term);
+                if (normalizedTerm.Length <= 2)
+                    continue;
+
+                var count = CountOccurrences(text, normalizedTerm);
+                if (count > 0)
+                    score += Math.Min(count, 5);
+
+                if (title.Contains(normalizedTerm))
+                    score += 3.5f;
+
+                if (metadata.Contains(normalizedTerm))
+                    score += 2;
+
+                if (LooksLikeHeadingMatch(cleaned, normalizedTerm))
+                    score += 3;
+            }
+
+            foreach (var number in ExtractNumbers(questionText))
+            {
+                if (Regex.IsMatch(text, $@"\b{Regex.Escape(number)}\b", RegexOptions.CultureInvariant))
+                    score += 4;
+            }
+
+            var coveredTerms = terms
+                .Select(NormalizeForMatch)
+                .Where(term => term.Length > 2 && text.Contains(term))
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .Count();
+
+            if (coveredTerms >= 2)
+                score += coveredTerms * 1.5f;
+
+            var asksForAmount = IsAmountOrLimitQuestion(questionText);
+            if (asksForAmount &&
+                Regex.IsMatch(text, @"\b\d+(?:[.,]\d+)?\b", RegexOptions.CultureInvariant) &&
+                coveredTerms >= 2)
+            {
+                score += 6;
+            }
+
+            if (asksForAmount)
+            {
+                var hasNumericLimitLanguage = QuestionContainsAny(text, "minimum", "maximum", "au moins", "ne peut", "superieur", "exceder", "depasse", "limite");
+                var hasQuestionUnit = terms.Any(term => text.Contains(NormalizeForMatch(term)) && QuestionContainsAny(NormalizeForMatch(term), "credit", "credits", "ects", "hour", "hours", "heures", "day", "days", "jours"));
+                var hasQuestionAction = terms.Any(term => text.Contains(NormalizeForMatch(term)) && QuestionContainsAny(NormalizeForMatch(term), "register", "registered", "registration", "inscription", "inscrit", "inscrire", "student", "students", "etudiant", "etudiants", "semester", "semestre"));
+
+                if (hasNumericLimitLanguage)
+                    score += 8;
+
+                if (hasQuestionUnit && Regex.IsMatch(text, @"\b\d+(?:[.,]\d+)?\b", RegexOptions.CultureInvariant))
+                    score += 10;
+
+                if (hasQuestionUnit && hasQuestionAction)
+                    score += 8;
+            }
+
+            if (text.Contains("table des matieres") || text.Contains("table of contents"))
+                score -= 4;
+
+            if (cleaned.Length < 80)
+                score -= 1;
+
+            score += GetGenericDocumentFitScore(chunk, questionText);
+
+            return score;
+        }
+
+        private static List<string> ExtractNumbers(string text)
+        {
+            return Regex.Matches(text ?? "", @"\b\d+(?:[.,]\d+)?\b", RegexOptions.CultureInvariant)
+                .Select(match => match.Value.Replace(',', '.'))
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .ToList();
+        }
+
+        private static List<Document> FindStrictDocumentReferences(List<Document> documents, string questionText)
+        {
+            var normalizedQuestion = NormalizeForMatch(questionText);
+            var questionTokens = Tokenize(questionText)
+                .Select(NormalizeForMatch)
+                .ToHashSet(StringComparer.OrdinalIgnoreCase);
+
+            return documents
+                .Select(doc => new
+                {
+                    Document = doc,
+                    Score = ScoreStrictDocumentReference(doc, normalizedQuestion, questionTokens)
+                })
+                .Where(item => item.Score > 0)
+                .OrderByDescending(item => item.Score)
+                .ThenBy(item => item.Document.Title)
+                .Select(item => item.Document)
+                .ToList();
+        }
+
+        private static int ScoreStrictDocumentReference(Document doc, string normalizedQuestion, HashSet<string> questionTokens)
+        {
+            var score = 0;
+            var title = NormalizeForMatch(doc.Title);
+            var fileName = NormalizeForMatch(Path.GetFileNameWithoutExtension(doc.OriginalFileName ?? ""));
+
+            if (title.Length > 3 && (normalizedQuestion.Contains(title) || title.Contains(normalizedQuestion)))
+                score += 100;
+
+            if (fileName.Length > 3 && (normalizedQuestion.Contains(fileName) || fileName.Contains(normalizedQuestion)))
+                score += 80;
+
+            var titleTokens = Tokenize(doc.Title ?? "")
+                .Select(NormalizeForMatch)
+                .Where(term => term.Length > 2 && !GenericAnswerTerms.Contains(term))
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .ToList();
+
+            if (titleTokens.Count > 0)
+            {
+                var overlap = titleTokens.Count(questionTokens.Contains);
+                if (overlap == titleTokens.Count)
+                    score += 70;
+                else if (titleTokens.Count >= 3 && overlap >= titleTokens.Count - 1)
+                    score += 30;
+            }
+
+            return score;
+        }
+
+        private static string BuildDocumentDisambiguationAnswer(List<Document> matches)
+        {
+            var titles = matches
+                .Take(5)
+                .Select(document => $"- {document.Title}")
+                .ToList();
+
+            return "I found more than one uploaded document that matches that reference. Please ask again with the exact document title:\n\n" + string.Join("\n", titles);
         }
 
         private async Task<Answer> SaveAnswerAsync(int questionId, string text, float confidence)
