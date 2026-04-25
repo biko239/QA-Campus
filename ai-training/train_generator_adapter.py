@@ -23,7 +23,14 @@ class ChatDataset(Dataset):
         with open(data_path, "r", encoding="utf-8") as f:
             for line in f:
                 if line.strip():
-                    self.items.append(json.loads(line))
+                    item = json.loads(line)
+                    self.items.append(item)
+
+        if os.environ.get("FYP_GENERATOR_HARD_ONLY", "0") == "1":
+            hard_items = [item for item in self.items if item.get("hard_example")]
+            if hard_items:
+                self.items = hard_items
+                print(f"Generator training on hard examples only: {len(self.items)} examples")
 
     def __len__(self):
         return len(self.items)

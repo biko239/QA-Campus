@@ -26,6 +26,7 @@ export const api = {
   registerAdmin: (payload) =>
     request("/api/auth/admins/register", { method: "POST", body: JSON.stringify(payload) }),
   publicDocuments: () => request("/api/student/documents"),
+  chatHistory: () => request("/api/student/chat/history"),
   ask: (question) => request("/api/student/ask", { method: "POST", body: JSON.stringify({ question }) }),
   dashboard: () => request("/api/admin/dashboard"),
   documents: () => request("/api/admin/documents"),

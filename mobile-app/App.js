@@ -119,18 +119,29 @@ function AdminRegister({ setScreen, setNotice }) {
 function StudentChat() {
   const [docs, setDocs] = useState([]);
   const [question, setQuestion] = useState("");
-  const [answer, setAnswer] = useState("");
-  const [citations, setCitations] = useState([]);
+  const [messages, setMessages] = useState([]);
 
   useEffect(() => {
     api.publicDocuments().then(setDocs).catch((err) => Alert.alert("Documents", err.message));
+    api.chatHistory().then(setMessages).catch(() => {});
   }, []);
 
   async function ask() {
+    const text = question.trim();
+    if (!text) return;
+
     try {
-      const result = await api.ask(question);
-      setAnswer(result.answer);
-      setCitations(result.citations || []);
+      const result = await api.ask(text);
+      setMessages((current) => [
+        ...current,
+        {
+          id: result.id || Date.now(),
+          question: result.question || text,
+          askedAt: result.askedAt || new Date().toISOString(),
+          answer: result.answer,
+          citations: result.citations || [],
+        },
+      ]);
       setQuestion("");
     } catch (err) {
       Alert.alert("Question failed", err.message);
@@ -141,13 +152,24 @@ function StudentChat() {
     <View>
       <Title title="Q&A Chat Interface" subtitle="Ask questions about your university documents" />
       <View style={styles.panel}>
-        <Button label="New Chat" variant="dark" onPress={() => { setAnswer(""); setCitations([]); }} />
+        <Button label="New Chat" variant="dark" onPress={() => setMessages([])} />
+        <Button label="Load History" onPress={() => api.chatHistory().then(setMessages).catch((err) => Alert.alert("History", err.message))} />
         <Text style={styles.heading}>Available Documents</Text>
         {docs.length ? docs.map((doc) => <Text key={doc.id} style={styles.docItem}>{doc.title}{"\n"}{doc.department} - {doc.category}</Text>) : <Text>No processed public documents available yet.</Text>}
       </View>
       <View style={styles.panel}>
-        {answer ? <Text style={styles.answer}>{answer}</Text> : <Text>Welcome. Ask a question and the assistant will answer using the uploaded documents.</Text>}
-        {citations.map((citation) => <Text key={citation.chunkId} style={styles.docItem}>{citation.documentTitle}{"\n"}Chunk ID: {citation.chunkId} | Score: {citation.score}{"\n"}{citation.preview}</Text>)}
+        {messages.length ? messages.map((message) => (
+          <View key={message.id} style={styles.chatTurn}>
+            <Text style={styles.question}>You: {message.question}</Text>
+            <Text style={styles.answer}>{message.answer}</Text>
+            {message.citations?.map((citation) => (
+              <Text key={`${message.id}-${citation.chunkId}`} style={styles.docItem}>
+                Sources used{"\n"}{citation.documentTitle}{"\n"}Chunk ID: {citation.chunkId} | Score: {citation.score}{"\n"}
+                {citation.evidence || citation.preview}
+              </Text>
+            ))}
+          </View>
+        )) : <Text>Welcome. Ask a question and the assistant will answer using the uploaded documents.</Text>}
       </View>
       <TextInput style={styles.input} value={question} onChangeText={setQuestion} placeholder="Type your question here..." />
       <Button label="Send" variant="dark" onPress={ask} />
@@ -300,6 +322,8 @@ const styles = StyleSheet.create({
   panel: { backgroundColor: "#ffffff", borderWidth: 1, borderColor: "#a2adba", padding: 16, marginBottom: 16 },
   heading: { fontSize: 18, fontWeight: "700", color: "#10233f", marginBottom: 8 },
   docItem: { borderBottomWidth: 1, borderColor: "#b8c0cc", paddingVertical: 10 },
+  chatTurn: { paddingBottom: 14, marginBottom: 14, borderBottomWidth: 1, borderBottomColor: "#d0d7e2" },
+  question: { fontSize: 15, fontWeight: "800", color: "#12375f", marginBottom: 8 },
   detailLine: { marginBottom: 8, color: "#10233f" },
   answer: { fontSize: 16, lineHeight: 24 },
   metricGrid: { gap: 12, marginBottom: 16 },

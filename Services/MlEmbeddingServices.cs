@@ -14,7 +14,7 @@ namespace Fyp.Services
             _cfg = cfg;
         }
 
-        public async Task<float[]> EmbedAsync(string text)
+        public async Task<float[]> EmbedAsync(string text, string mode = "document")
         {
             if (string.IsNullOrWhiteSpace(text))
                 throw new ArgumentException("Text cannot be empty.", nameof(text));
@@ -24,7 +24,7 @@ namespace Fyp.Services
             var baseUrl = (_cfg["AiService:BaseUrl"] ?? _cfg["MlService:BaseUrl"] ?? "http://127.0.0.1:8000")
                 .TrimEnd('/');
 
-            var body = JsonSerializer.Serialize(new { text });
+            var body = JsonSerializer.Serialize(new { text, mode });
 
             var response = await client.PostAsync(
                 $"{baseUrl}/embed",

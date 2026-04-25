@@ -29,6 +29,19 @@ def main():
     with open(data_path, "r", encoding="utf-8") as f:
         raw_data = json.load(f)
 
+    if os.environ.get("FYP_RETRIEVER_HARD_ONLY", "0") == "1":
+        hard_data = [item for item in raw_data if item.get("hard_example")]
+        if hard_data:
+            raw_data = hard_data
+            print(f"Training on hard examples only: {len(raw_data)} examples")
+
+    max_examples = int(os.environ.get("FYP_RETRIEVER_MAX_EXAMPLES", "0"))
+    if max_examples > 0 and len(raw_data) > max_examples:
+        hard_data = [item for item in raw_data if item.get("hard_example")]
+        regular_data = [item for item in raw_data if not item.get("hard_example")]
+        raw_data = (hard_data + regular_data)[:max_examples]
+        print(f"Training data limited to: {len(raw_data)} examples")
+
     train_examples = []
     for item in raw_data:
         question = item["question"].strip()

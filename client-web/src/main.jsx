@@ -206,23 +206,34 @@ function AdminRegister({ setView, setNotice }) {
 function StudentChat() {
   const [docs, setDocs] = useState([]);
   const [question, setQuestion] = useState("");
-  const [answer, setAnswer] = useState("");
-  const [citations, setCitations] = useState([]);
+  const [messages, setMessages] = useState([]);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
 
   useEffect(() => {
     api.publicDocuments().then(setDocs).catch((err) => setError(err.message));
+    api.chatHistory().then(setMessages).catch(() => {});
   }, []);
 
   async function submit(e) {
     e.preventDefault();
+    const text = question.trim();
+    if (!text || busy) return;
+
     setBusy(true);
     setError("");
     try {
-      const result = await api.ask(question);
-      setAnswer(result.answer);
-      setCitations(result.citations || []);
+      const result = await api.ask(text);
+      setMessages((current) => [
+        ...current,
+        {
+          id: result.id || crypto.randomUUID(),
+          question: result.question || text,
+          askedAt: result.askedAt || new Date().toISOString(),
+          answer: result.answer,
+          citations: result.citations || [],
+        },
+      ]);
       setQuestion("");
     } catch (err) {
       setError(err.message);
@@ -237,7 +248,8 @@ function StudentChat() {
       {error && <div className="error-box">{error}</div>}
       <div className="chat-shell">
         <aside className="chat-sidebar">
-          <button className="primary-btn wide-btn" onClick={() => { setAnswer(""); setCitations([]); }}>New Chat</button>
+          <button className="primary-btn wide-btn" onClick={() => setMessages([])}>New Chat</button>
+          <button className="secondary-btn wide-btn" onClick={() => api.chatHistory().then(setMessages).catch((err) => setError(err.message))}>Load History</button>
           <div className="docs-panel">
             <h3>Available Documents</h3>
             {docs.length ? docs.map((doc) => <p key={doc.id}><strong>{doc.title}</strong><br /><span>{doc.department} - {doc.category}</span></p>) : <p>No processed public documents available yet.</p>}
@@ -245,8 +257,38 @@ function StudentChat() {
         </aside>
         <section className="chat-main">
           <div className="chat-messages">
-            {answer ? <div className="docs-panel"><strong>Answer</strong><p className="pre-line">{answer}</p></div> : <p>Welcome. Ask a question and the assistant will answer using the uploaded documents.</p>}
-            {citations.length > 0 && <div className="docs-panel"><h3>Proof / Retrieved Chunks</h3>{citations.map((citation) => <div className="citation" key={citation.chunkId}><strong>{citation.documentTitle}</strong><br /><span>Chunk ID: {citation.chunkId} | Score: {citation.score}</span><p>{citation.preview}</p></div>)}</div>}
+            {messages.length === 0 && (
+              <div className="empty-chat">
+                Welcome. Ask a question and the assistant will answer using the uploaded documents.
+              </div>
+            )}
+            {messages.map((message) => (
+              <article className="chat-turn" key={message.id}>
+                <div className="question-bubble">
+                  <div className="message-meta">You{message.askedAt ? ` - ${new Date(message.askedAt).toLocaleString()}` : ""}</div>
+                  <p>{message.question}</p>
+                </div>
+                <div className="answer-bubble">
+                  <div className="message-meta">Assistant</div>
+                  <p className="pre-line">{message.answer}</p>
+                  {message.citations?.length > 0 && (
+                    <details className="citation-details">
+                      <summary>Sources used</summary>
+                      {message.citations.map((citation) => (
+                        <div className="citation" key={`${message.id}-${citation.chunkId}`}>
+                          <strong>{citation.documentTitle}</strong><br />
+                          <span>Chunk ID: {citation.chunkId} | Score: {citation.score}</span>
+                          <p className="citation-preview">
+                            <HighlightedText text={citation.evidence || citation.preview} highlights={citation.highlights || []} />
+                          </p>
+                        </div>
+                      ))}
+                    </details>
+                  )}
+                </div>
+              </article>
+            ))}
+            {busy && <div className="answer-bubble thinking">I am reading the uploaded documents and preparing a clear answer...</div>}
           </div>
           <form className="chat-input-bar" onSubmit={submit}>
             <input value={question} onChange={(e) => setQuestion(e.target.value)} placeholder="Type your question here..." />
@@ -361,6 +403,28 @@ function PageTitle({ title, subtitle, icon }) {
 
 function Field({ label, value, onChange, type = "text", className = "", name }) {
   return <div className={className}><label>{label}</label><input name={name} type={type} value={value} onChange={onChange ? (e) => onChange(e.target.value) : undefined} /></div>;
+}
+
+function HighlightedText({ text = "", highlights = [] }) {
+  const cleanHighlights = highlights
+    .filter(Boolean)
+    .map((value) => String(value).trim())
+    .filter((value) => value.length > 2)
+    .sort((a, b) => b.length - a.length)
+    .slice(0, 18);
+
+  if (!text || cleanHighlights.length === 0) return text;
+
+  const pattern = new RegExp(`(${cleanHighlights.map(escapeRegExp).join("|")})`, "gi");
+  return text.split(pattern).map((part, index) => (
+    cleanHighlights.some((term) => term.localeCompare(part, undefined, { sensitivity: "accent" }) === 0)
+      ? <mark key={`${part}-${index}`}>{part}</mark>
+      : <React.Fragment key={`${part}-${index}`}>{part}</React.Fragment>
+  ));
+}
+
+function escapeRegExp(value) {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
 function labelize(value) {

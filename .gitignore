@@ -33,7 +33,9 @@ packages/
 
 # IDE
 .idea/
-.vscode/
+.vscode/*
+!.vscode/tasks.json
+!.vscode/launch.json
 *.swp
 *.swo
 
@@ -43,6 +45,7 @@ Thumbs.db
 
 # Logs
 *.log
+figma-preview.png
 
 # Frontend build output
 dist/

@@ -39,6 +39,48 @@ public class ApiStudentController : ControllerBase
         return Ok(docs);
     }
 
+    [HttpGet("chat/history")]
+    public async Task<IActionResult> ChatHistory()
+    {
+        var role = HttpContext.Session.GetString("Role");
+        var userId = HttpContext.Session.GetInt32("UserId");
+
+        if (role != "Student" || userId == null)
+            return Unauthorized(new { message = "Student login required." });
+
+        var rows = await _db.Questions
+            .AsNoTracking()
+            .Include(q => q.Answer)
+                .ThenInclude(a => a!.ChunkUsages)
+                    .ThenInclude(cu => cu.Chunk)
+                        .ThenInclude(c => c!.Document)
+            .Where(q => q.UserId == userId.Value && q.Answer != null)
+            .OrderByDescending(q => q.AskedAt)
+            .Take(50)
+            .ToListAsync();
+
+        var history = rows
+            .OrderBy(q => q.AskedAt)
+            .Select(q => new
+            {
+                id = q.Id,
+                question = q.Text,
+                askedAt = q.AskedAt,
+                answer = q.Answer!.Text,
+                citations = q.Answer.ChunkUsages.Select(cu => new
+                {
+                    documentTitle = cu.Chunk?.Document?.Title ?? "Unknown Document",
+                    chunkId = cu.ChunkId,
+                    score = cu.Score,
+                    preview = RagService.FormatSourcePreview(cu.Chunk?.Text ?? ""),
+                    evidence = RagService.BuildEvidencePreview(cu.Chunk?.Text ?? "", q.Text, q.Answer.Text),
+                    highlights = RagService.BuildEvidenceHighlights(q.Text, q.Answer.Text)
+                })
+            });
+
+        return Ok(history);
+    }
+
     [HttpPost("ask")]
     public async Task<IActionResult> Ask(AskRequest request)
     {
@@ -57,13 +99,19 @@ public class ApiStudentController : ControllerBase
 
             return Ok(new
             {
+                id = result.answer.QuestionId,
+                answerId = result.answer.Id,
+                question = request.Question.Trim(),
+                askedAt = DateTime.UtcNow,
                 answer = result.answer.Text,
                 citations = result.citations.Select(c => new
                 {
                     documentTitle = c.chunk.Document?.Title ?? "Unknown Document",
                     chunkId = c.chunk.Id,
                     score = c.score,
-                    preview = c.chunk.Text.Length > 300 ? c.chunk.Text[..300] + "..." : c.chunk.Text
+                    preview = RagService.FormatSourcePreview(c.chunk.Text),
+                    evidence = RagService.BuildEvidencePreview(c.chunk.Text, request.Question, result.answer.Text),
+                    highlights = RagService.BuildEvidenceHighlights(request.Question, result.answer.Text)
                 })
             });
         }
