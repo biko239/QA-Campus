@@ -6,7 +6,7 @@ from sentence_transformers import SentenceTransformer
 
 
 DEFAULT_AI_DIR = Path(r"C:\Users\alian.ALI\Desktop\ai")
-GENERAL_RETRIEVER = os.environ.get("FYP_GENERAL_RETRIEVER", "BAAI/bge-small-en-v1.5")
+GENERAL_RETRIEVER = os.environ.get("FYP_GENERAL_RETRIEVER", "intfloat/multilingual-e5-small")
 
 
 def remove_path(path: Path) -> None:

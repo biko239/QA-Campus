@@ -112,14 +112,22 @@ namespace Fyp.Services
             var explicitDocumentMatches = FindExplicitDocumentMatches(documents, questionText);
             var recentDocument = await GetRecentDocumentContextAsync(userId, question.Id, documents);
             var targetDocument = explicitDocumentMatches.Count == 1 ? explicitDocumentMatches[0] : recentDocument;
+            var calendarIntent = LooksLikeCalendarQuestion(questionText);
+            var creditRegistrationIntent = LooksLikeCreditRegistrationQuestion(questionText);
 
-            if (targetDocument == null && LooksLikeCalendarQuestion(questionText))
+            if (targetDocument != null && IsCalendarDocument(targetDocument) && !calendarIntent)
+                targetDocument = null;
+
+            if (creditRegistrationIntent)
+                targetDocument = FindBestAcademicRulesDocument(documents, questionText) ?? targetDocument;
+
+            if (targetDocument == null && calendarIntent && !creditRegistrationIntent)
             {
                 var calendarDocuments = documents.Where(IsCalendarDocument).ToList();
                 if (calendarDocuments.Count == 1)
                     targetDocument = calendarDocuments[0];
             }
-            else if (explicitDocumentMatches.Count == 0 && LooksLikeCalendarQuestion(questionText))
+            else if (explicitDocumentMatches.Count == 0 && calendarIntent && !creditRegistrationIntent)
             {
                 var calendarDocuments = documents.Where(IsCalendarDocument).ToList();
                 if (calendarDocuments.Count == 1)
@@ -169,6 +177,9 @@ namespace Fyp.Services
             int topK = int.Parse(_cfg["Rag:TopK"] ?? "4");
             var searchTopK = targetDocument == null ? topK : Math.Max(topK, 8);
             var citations = await TryVectorSearchAsync(questionText, searchTopK, targetDocument?.Id);
+
+            if (!calendarIntent)
+                citations = citations.Where(c => c.chunk.Document == null || !IsCalendarDocument(c.chunk.Document)).ToList();
 
             if (citations.Count == 0)
                 citations = await SearchDatabaseChunksAsync(questionText, searchTopK, targetDocument?.Id);
@@ -287,7 +298,11 @@ namespace Fyp.Services
 
         private async Task<List<(DocumentChunk chunk, float score)>> SearchDatabaseChunksAsync(string questionText, int topK, int? targetDocumentId)
         {
+            var creditRegistrationIntent = LooksLikeCreditRegistrationQuestion(questionText);
             var terms = ExpandQueryTerms(Tokenize(questionText))
+                .Concat(creditRegistrationIntent
+                    ? new[] { "36", "24", "15", "credits", "ects", "maximum", "recteur", "rector", "inscription", "inscrit", "semestre", "semester" }
+                    : Array.Empty<string>())
                 .Distinct(StringComparer.OrdinalIgnoreCase)
                 .ToList();
             if (terms.Count == 0)
@@ -302,9 +317,12 @@ namespace Fyp.Services
                     (!targetDocumentId.HasValue || c.DocumentId == targetDocumentId.Value))
                 .ToListAsync();
 
-            var aiRanked = await TryAiRerankChunksAsync(questionText, candidates, topK);
-            if (aiRanked.Count > 0)
-                return aiRanked;
+            if (!creditRegistrationIntent)
+            {
+                var aiRanked = await TryAiRerankChunksAsync(questionText, candidates, topK);
+                if (aiRanked.Count > 0)
+                    return aiRanked;
+            }
 
             var scored = candidates
                 .Select(chunk => (chunk, score: ScoreChunk(chunk, terms, questionText)))
@@ -883,6 +901,73 @@ namespace Fyp.Services
             };
         }
 
+        private static bool LooksLikeCreditRegistrationQuestion(string text)
+        {
+            var normalized = NormalizeForMatch(text);
+            var tokens = Tokenize(text)
+                .Select(NormalizeForMatch)
+                .ToHashSet(StringComparer.OrdinalIgnoreCase);
+
+            var mentionsCredits = tokens.Overlaps(new[] { "credit", "credits", "ects" });
+            var mentionsSemester = tokens.Overlaps(new[] { "semester", "semesters", "semestre", "semestres", "sem" });
+            var mentionsRegistration = tokens.Overlaps(new[]
+            {
+                "register",
+                "registered",
+                "registration",
+                "inscription",
+                "inscrit",
+                "inscrite",
+                "inscrire",
+                "maximum",
+                "max",
+                "full",
+                "part",
+                "time",
+                "temps",
+                "plein",
+                "partiel"
+            });
+
+            return mentionsCredits && (mentionsSemester || mentionsRegistration || normalized.Contains("how much") || normalized.Contains("how many"));
+        }
+
+        private static Document? FindBestAcademicRulesDocument(List<Document> documents, string questionText)
+        {
+            var terms = ExpandQueryTerms(Tokenize(questionText))
+                .Concat(new[] { "credits", "ects", "semestre", "semester", "inscription", "36", "24", "15" })
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .ToList();
+
+            return documents
+                .Where(doc => !IsCalendarDocument(doc))
+                .Select(doc => new
+                {
+                    Document = doc,
+                    Score = ScoreDocumentTopicMatch(doc, terms, questionText) + ScoreAcademicDocumentSignals(doc)
+                })
+                .Where(item => item.Score > 0)
+                .OrderByDescending(item => item.Score)
+                .ThenBy(item => item.Document.Title)
+                .Select(item => item.Document)
+                .FirstOrDefault();
+        }
+
+        private static float ScoreAcademicDocumentSignals(Document doc)
+        {
+            var metadata = NormalizeForMatch($"{doc.Title} {doc.OriginalFileName} {doc.Category} {doc.Tags}");
+            var score = 0f;
+
+            if (QuestionContainsAny(metadata, "reglement", "regulations", "studies", "etudes", "academic", "academique"))
+                score += 10;
+
+            var sample = NormalizeForMatch(string.Join(" ", doc.Chunks.OrderBy(c => c.ChunkIndex).Take(8).Select(c => c.Text ?? "")));
+            if (QuestionContainsAny(sample, "credits ects", "36 credits", "24 credits", "15 credits", "semestre", "inscription"))
+                score += 12;
+
+            return score;
+        }
+
         private static bool IsCalendarDocument(Document doc)
         {
             var metadata = $"{doc.Title} {doc.OriginalFileName} {doc.Category} {doc.Tags}".ToLowerInvariant();
@@ -897,18 +982,26 @@ namespace Fyp.Services
                 .ToHashSet(StringComparer.OrdinalIgnoreCase);
 
             var hasMonth = ExtractMonthNumbers(normalized).Count > 0;
-            var hasCalendarTerm = tokens.Overlaps(new[]
+            if (LooksLikeCreditRegistrationQuestion(text))
+                return false;
+
+            var hasDateWord = tokens.Overlaps(new[] { "when", "date", "dates", "deadline", "deadlines" });
+            var hasCalendarWord = tokens.Overlaps(new[] { "calendar", "calendrier" });
+            var hasTimePeriodWord = tokens.Overlaps(new[] { "holiday", "holidays", "vacation", "break", "rdd", "graduation", "summer", "trimester", "trim" });
+            var hasBoundaryWord = tokens.Overlaps(new[]
             {
-                "calendar", "calendrier", "deadline", "deadlines", "date", "dates",
-                "semester", "semesters", "semestre", "semestres", "sem", "holiday", "holidays",
-                "vacation", "break", "rdd", "diploma", "diplomas", "graduation",
-                "summer", "trimester", "trim", "end", "ends", "finish", "finishes",
-                "finished", "ending", "fin"
+                "start", "starts", "begin", "begins", "beginning", "debut",
+                "end", "ends", "finish", "finishes", "finished", "ending", "fin"
             });
+            var mentionsSemester = tokens.Overlaps(new[] { "semester", "semesters", "semestre", "semestres", "sem" });
             var hasExamTerm = tokens.Overlaps(new[] { "exam", "exams", "examen", "examens", "examination", "examinations" });
             var asksWhen = normalized.Contains("when") || normalized.Contains("date") || normalized.Contains("dates");
 
-            return hasMonth || hasCalendarTerm || (hasExamTerm && asksWhen);
+            return hasMonth ||
+                   hasCalendarWord ||
+                   hasTimePeriodWord ||
+                   (mentionsSemester && (hasDateWord || hasBoundaryWord)) ||
+                   (hasExamTerm && asksWhen);
         }
 
         private bool IsSmallTalk(string text)
@@ -939,14 +1032,17 @@ namespace Fyp.Services
             if (citations.Count == 0)
                 return "I could not find enough reliable information in the uploaded university documents.";
 
-            var calendarCitations = citations
-                .Where(c => c.chunk.Document != null && IsCalendarDocument(c.chunk.Document))
-                .ToList();
-            if (calendarCitations.Count > 0 && LooksLikeCalendarQuestion(questionText))
-                return BuildCalendarExtractiveAnswer(calendarCitations, questionText);
+            if (LooksLikeCalendarQuestion(questionText))
+            {
+                var calendarCitations = citations
+                    .Where(c => c.chunk.Document != null && IsCalendarDocument(c.chunk.Document))
+                    .ToList();
+                if (calendarCitations.Count > 0)
+                    return BuildCalendarExtractiveAnswer(calendarCitations, questionText);
 
-            if (citations.All(c => c.chunk.Document != null && IsCalendarDocument(c.chunk.Document)))
-                return BuildCalendarExtractiveAnswer(citations, questionText);
+                if (citations.All(c => c.chunk.Document != null && IsCalendarDocument(c.chunk.Document)))
+                    return BuildCalendarExtractiveAnswer(citations, questionText);
+            }
 
             var sourceAnswer = BuildExtractiveAnswer(citations, questionText);
             var useGenerator = bool.TryParse(_cfg["Rag:UseGenerator"], out var configuredUseGenerator) && configuredUseGenerator;
@@ -997,8 +1093,15 @@ namespace Fyp.Services
 
         private static string BuildExtractiveAnswer(List<(DocumentChunk chunk, float score)> citations, string questionText)
         {
-            if (citations.Count > 0 && citations.All(c => c.chunk.Document != null && IsCalendarDocument(c.chunk.Document)))
+            if (citations.Count > 0 && LooksLikeCalendarQuestion(questionText) && citations.All(c => c.chunk.Document != null && IsCalendarDocument(c.chunk.Document)))
                 return BuildCalendarExtractiveAnswer(citations, questionText);
+
+            if (LooksLikeCreditRegistrationQuestion(questionText))
+            {
+                var creditAnswer = TryBuildCreditRegistrationAnswer(citations);
+                if (!string.IsNullOrWhiteSpace(creditAnswer))
+                    return creditAnswer;
+            }
 
             if (IsSummaryLike(questionText))
                 return BuildSummaryAnswer(citations, questionText);
@@ -1043,6 +1146,106 @@ namespace Fyp.Services
             }
 
             return "I found relevant information in these uploaded documents:\n\n" + string.Join("\n\n", parts) + "\n\nYou can open the proof to see the exact PDF evidence I used.";
+        }
+
+        private static string? TryBuildCreditRegistrationAnswer(List<(DocumentChunk chunk, float score)> citations)
+        {
+            var creditCitations = citations
+                .Where(c => c.chunk.Document != null && !IsCalendarDocument(c.chunk.Document))
+                .Where(c => QuestionContainsAny(NormalizeForMatch(c.chunk.Text), "credit", "credits", "ects"))
+                .OrderByDescending(c => ScoreCreditRegistrationEvidence(c.chunk.Text))
+                .ToList();
+
+            if (creditCitations.Count == 0)
+                return null;
+
+            var best = creditCitations.First();
+            var text = CleanTextForAnswer(best.chunk.Text);
+            var normalized = NormalizeForMatch(text);
+            var title = best.chunk.Document?.Title ?? "the uploaded PDF";
+            var snippets = new List<string>();
+
+            var maxSnippet = ExtractWindowAround(text, "36", 260, 560);
+            if (string.IsNullOrWhiteSpace(maxSnippet))
+                maxSnippet = ExtractBestSnippet(text, new List<string> { "36", "credits", "semestre", "maximum", "derogation", "recteur" }, 560);
+            if (!string.IsNullOrWhiteSpace(maxSnippet))
+                snippets.Add(PolishSnippet(maxSnippet));
+
+            var statusSnippet = ExtractWindowAround(text, "24 crédits", 220, 360);
+            if (string.IsNullOrWhiteSpace(statusSnippet))
+                statusSnippet = ExtractWindowAround(text, "24 credits", 220, 360);
+            if (string.IsNullOrWhiteSpace(statusSnippet))
+                statusSnippet = ExtractWindowAround(text, "15 crédits", 220, 360);
+            if (string.IsNullOrWhiteSpace(statusSnippet))
+                statusSnippet = ExtractWindowAround(text, "15 credits", 220, 360);
+            if (string.IsNullOrWhiteSpace(statusSnippet))
+                statusSnippet = ExtractBestSnippet(text, new List<string> { "24", "15", "credits", "temps plein", "temps partiel" }, 420);
+            if (!string.IsNullOrWhiteSpace(statusSnippet) &&
+                !snippets.Any(s => NormalizeForMatch(s) == NormalizeForMatch(statusSnippet)))
+            {
+                snippets.Add(PolishSnippet(statusSnippet));
+            }
+
+            if (normalized.Contains("36 credits") || normalized.Contains("36 credit") || normalized.Contains("36 credits ects"))
+            {
+                return $"A student can register for up to 36 ECTS credits per semester. If the registration goes above 36 credits, the PDF says an exceptional Rector exemption is needed after a written, justified request validated first by the institution head.\n\nSource: \"{title}\"\n\nRelevant PDF text:\n- {string.Join("\n- ", snippets.Take(2))}";
+            }
+
+            if (normalized.Contains("24 credits") || normalized.Contains("15 credits"))
+            {
+                return $"The PDF says a full-time student is registered for at least 24 ECTS credits in the current semester, while part-time status starts at 15 ECTS credits.\n\nSource: \"{title}\"\n\nRelevant PDF text:\n- {string.Join("\n- ", snippets.Take(2))}";
+            }
+
+            if (snippets.Count == 0)
+                return null;
+
+            return $"I found the credit rule in \"{title}\":\n\n- {string.Join("\n- ", snippets.Take(2))}";
+        }
+
+        private static string ExtractWindowAround(string text, string needle, int before, int after)
+        {
+            if (string.IsNullOrWhiteSpace(text) || string.IsNullOrWhiteSpace(needle))
+                return "";
+
+            var index = text.IndexOf(needle, StringComparison.OrdinalIgnoreCase);
+            if (index < 0)
+                return "";
+
+            var start = Math.Max(0, index - before);
+            var end = Math.Min(text.Length, index + needle.Length + after);
+            var window = text[start..end];
+
+            var firstBoundary = Math.Max(
+                Math.Max(window.IndexOf(". ", StringComparison.Ordinal), window.IndexOf("; ", StringComparison.Ordinal)),
+                window.IndexOf(": ", StringComparison.Ordinal));
+            if (firstBoundary >= 0 && firstBoundary < before / 2)
+                window = window[(firstBoundary + 2)..];
+
+            var lastPeriod = window.LastIndexOf(". ", StringComparison.Ordinal);
+            if (lastPeriod > index - start && lastPeriod > 80)
+                window = window[..(lastPeriod + 1)];
+
+            return window.Trim();
+        }
+
+        private static float ScoreCreditRegistrationEvidence(string text)
+        {
+            var normalized = NormalizeForMatch(text);
+            var score = 0f;
+
+            if (QuestionContainsAny(normalized, "36 credits", "36 credit"))
+                score += 20;
+
+            if (QuestionContainsAny(normalized, "maximum", "derogation", "recteur", "rector"))
+                score += 10;
+
+            if (QuestionContainsAny(normalized, "24 credits", "15 credits", "temps plein", "temps partiel"))
+                score += 8;
+
+            if (QuestionContainsAny(normalized, "semestre", "semester", "inscription", "inscrit"))
+                score += 6;
+
+            return score;
         }
 
         private static int GetAnswerSnippetLimit(string questionText, int documentGroupCount)
@@ -2442,6 +2645,18 @@ namespace Fyp.Services
 
             if (text.Contains("table des matieres") || text.Contains("table of content"))
                 score -= 0.75f;
+
+            if (LooksLikeCreditRegistrationQuestion(questionText))
+            {
+                score += ScoreCreditRegistrationEvidence(cleaned);
+
+                if (chunk.Document != null && IsCalendarDocument(chunk.Document))
+                    score -= 40;
+            }
+            else if (!LooksLikeCalendarQuestion(questionText) && chunk.Document != null && IsCalendarDocument(chunk.Document))
+            {
+                score -= 12;
+            }
 
             return score;
         }

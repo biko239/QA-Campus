@@ -26,11 +26,13 @@ This removes:
 - generated PDF training data
 - training checkpoints
 
-It keeps the base generator model and downloads a clean general retriever into:
+It keeps the base generator model and downloads a clean multilingual retriever into:
 
 ```text
 C:\Users\alian.ALI\Desktop\ai\models\retriever
 ```
+
+The default retriever is `intfloat/multilingual-e5-small`, which is light enough for this laptop and works better with mixed English/French PDFs than an English-only model.
 
 ## Advanced
 

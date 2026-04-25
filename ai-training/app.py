@@ -174,8 +174,8 @@ def generate_text(prompt: str) -> str:
 def retrieval_text(text: str, mode: Optional[str]) -> str:
     cleaned = (text or "").strip()
     if (mode or "").lower() == "query":
-        return "Represent this sentence for searching relevant passages: " + cleaned
-    return cleaned
+        return "query: " + cleaned
+    return "passage: " + cleaned
 
 # -----------------------------
 # Endpoints
